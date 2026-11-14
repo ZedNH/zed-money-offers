@@ -35,9 +35,14 @@ jobs:
           fi
           ls -la data/offers
 
+      # Offers printed in banner pictures and PDFs are read with OCR.
+      - name: Install OCR
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-ben poppler-utils > /dev/null
+
       - name: Collect
         env:
           OFFER_DATA_DIR: ${{ github.workspace }}/data/offers
+          OFFER_OCR: '1'
         run: node --experimental-strip-types server/src/offers/cli.ts
 
       - name: Shape it for the app

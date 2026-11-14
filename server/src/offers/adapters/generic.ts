@@ -29,6 +29,7 @@
  */
 
 import type { AdapterContext, AdapterResult, OfferSourceAdapter, RawOffer } from '../adapter.ts';
+import { mediaEnabled, mediaLinks, readMedia } from '../media.ts';
 import {
   extractEmbeddedState,
   extractJsonLd,
@@ -107,7 +108,7 @@ async function collectGeneric(url: string, follow: boolean, context: AdapterCont
   const fromSeed = readPage(seed.body, url);
   context.log(`${url}: ${String(fromSeed.length)} candidate${fromSeed.length === 1 ? '' : 's'} on the page itself`);
 
-  if (!follow) return { offers: fromSeed, pagesFetched, warnings };
+  if (!follow) return { offers: [...fromSeed, ...(await fromMedia([{ html: seed.body, url }], context))], pagesFetched, warnings };
 
   /*
    * A listing page very often carries none of the terms.
@@ -122,6 +123,7 @@ async function collectGeneric(url: string, follow: boolean, context: AdapterCont
   context.log(`following ${String(links.length)} offer page${links.length === 1 ? '' : 's'}`);
 
   const fromDetails: RawOffer[] = [];
+  const bodies: { html: string; url: string }[] = [{ html: seed.body, url }];
   for (const link of links) {
     const page = await context.fetchPage(link);
     pagesFetched += 1;
@@ -131,13 +133,41 @@ async function collectGeneric(url: string, follow: boolean, context: AdapterCont
       continue;
     }
     fromDetails.push(...readPage(page.body, link));
+    bodies.push({ html: page.body, url: link });
   }
 
   // When the detail pages produced anything, the listing's own blocks are the
   // same offers minus their terms — keeping both would file every promotion
   // twice, once complete and once as a bare title.
   const offers = fromDetails.length > 0 ? fromDetails : fromSeed;
+  // Offers that live only in a banner picture or a PDF of terms.
+  offers.push(...(await fromMedia(bodies, context)));
   return { offers, pagesFetched, warnings };
+}
+
+/**
+ * Offers read out of the pictures and PDFs on these pages (see `media.ts`).
+ * A picture is one offer; a PDF is usually a list of partners, so each line
+ * with a figure in it is read on its own.
+ */
+async function fromMedia(bodies: readonly { html: string; url: string }[], context: AdapterContext): Promise<RawOffer[]> {
+  if (!mediaEnabled()) return [];
+  const seen = new Set<string>();
+  const links = bodies.flatMap((b) => mediaLinks(b.html, b.url)).filter((l) => (seen.has(l.url) ? false : (seen.add(l.url), true)));
+  if (links.length === 0) return [];
+  const read = await readMedia(links, context.log);
+  const out: RawOffer[] = [];
+  for (const { url, text } of read) {
+    if (url.toLowerCase().includes('.pdf')) {
+      for (const line of text.split('\n')) {
+        const l = line.trim();
+        if (l.length >= 8 && /[A-Za-z]{3}/.test(l) && /\d\s*%|(?:tk|bdt|৳)\s*\d/i.test(l)) out.push(fromText(l.replace(/\s{2,}/g, '\n'), url));
+      }
+    } else {
+      out.push(fromText(text, url));
+    }
+  }
+  return out;
 }
 
 /**
