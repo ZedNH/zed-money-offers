@@ -1,0 +1,73 @@
+# Collect offers every day and publish them for the app.
+name: Collect offers
+
+on:
+  schedule:
+    # 21:30 UTC = 03:30 in Dhaka, when the banks' sites are quiet.
+    - cron: '30 21 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect-offers
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Start from yesterday's catalogue: a source that fails today keeps its offers.
+      - name: Restore the last catalogue
+        run: |
+          mkdir -p data/offers
+          if git fetch --depth=1 origin data; then
+            git show origin/data:catalogue.json.gz > data/offers/catalogue.json.gz && gunzip -f data/offers/catalogue.json.gz || true
+            git show origin/data:http-cache.json > data/offers/http-cache.json || true
+          fi
+          ls -la data/offers
+
+      - name: Collect
+        env:
+          OFFER_DATA_DIR: ${{ github.workspace }}/data/offers
+        run: node --experimental-strip-types server/src/offers/cli.ts
+
+      - name: Shape it for the app
+        run: |
+          node -e '
+            const fs = require("fs");
+            const file = JSON.parse(fs.readFileSync("data/offers/catalogue.json", "utf8"));
+            const offers = Array.isArray(file.offers) ? file.offers : [];
+            const sources = [...new Map(offers.map((o) => [o.sourceRef?.sourceKey, o.sourceRef?.sourceName])).entries()]
+              .filter(([k]) => k != null).map(([key, displayName]) => ({ key, displayName: displayName ?? key }));
+            const byProvider = {};
+            for (const o of offers) byProvider[o.provider] = (byProvider[o.provider] ?? 0) + 1;
+            fs.mkdirSync("publish", { recursive: true });
+            fs.writeFileSync("publish/catalogue.json", JSON.stringify({ updatedAt: file.updatedAt ?? new Date().toISOString(), refreshing: false, count: offers.length, sources, offers }));
+            fs.writeFileSync("publish/meta.json", JSON.stringify({ updatedAt: file.updatedAt, count: offers.length, byProvider }, null, 2));
+            if (offers.length < 100) { console.error("Too few offers (" + offers.length + ") — not publishing."); process.exit(1); }
+            console.log(offers.length + " offers", byProvider);
+          '
+          gzip -9 -c publish/catalogue.json > publish/catalogue.json.gz
+          cp data/offers/http-cache.json publish/http-cache.json || true
+          rm publish/catalogue.json
+          ls -la publish
+
+      # One commit on an orphan branch, replaced each day: the repo never grows.
+      - name: Publish to the data branch
+        run: |
+          cd publish
+          git init -q -b data
+          git config user.name "zed-offers-bot"
+          git config user.email "zed-offers-bot@users.noreply.github.com"
+          git add -A
+          git commit -qm "Offers $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data

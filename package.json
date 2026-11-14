@@ -1,0 +1,12 @@
+{
+  "name": "zed-money-offers",
+  "private": true,
+  "type": "module",
+  "description": "Collects bank and mobile wallet offers in Bangladesh every day for Zed Money.",
+  "engines": {
+    "node": ">=22"
+  },
+  "imports": {
+    "#src/*": "./src/*"
+  }
+}
