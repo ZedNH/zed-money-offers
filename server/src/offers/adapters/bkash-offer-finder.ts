@@ -212,11 +212,37 @@ async function collectFromBrandFeed(context: AdapterContext): Promise<AdapterRes
     return null;
   }
 
+  const { offers, warnings } = offersFromRows(rows as BrandRow[], categories);
+  context.log(`brand feed: ${String(offers.length)} merchants with live campaigns`);
+  return { offers, pagesFetched: 2, warnings };
+}
+
+
+/** The campaign words that name a shelf, for rows the search feed sends without a category id. */
+const SHELF_WORDS: [RegExp, string][] = [
+  [/superstore|super-?shop|grocery|bazar|mart/i, 'Grocery & Superstores'],
+  [/food|restaurant|dine|dining|cafe|pizza|burger/i, 'Food & Beverage'],
+  [/hotel|travel|ticket|air|flight|bus|tour|outing/i, 'Ticket & Travel'],
+  [/fashion|lifestyle|cloth|shoe|salon|beauty|wedding|jewel/i, 'Lifestyle'],
+  [/electronic|gadget|home|decor|furniture/i, 'Home Decor & Electronics'],
+  [/online|e-?commerce|shopping/i, 'Online Shopping'],
+  [/health|pharma|medicine|hospital|diagnostic/i, 'Healthcare & Pharmacy'],
+  [/cinema|movie|entertainment|game|park/i, 'Entertainment'],
+  [/school|course|education|learning/i, 'Education'],
+];
+
+function shelfFrom(slug: string): string {
+  for (const [words, shelf] of SHELF_WORDS) if (words.test(slug)) return shelf;
+  return '';
+}
+
+/** Brand rows (from the feed or the search) → offers. */
+function offersFromRows(rows: readonly BrandRow[], categories: ReadonlyMap<number, string>): { offers: RawOffer[]; warnings: string[] } {
   const offers: RawOffer[] = [];
   const warnings: string[] = [];
   let withCampaign = 0;
 
-  for (const row of rows as BrandRow[]) {
+  for (const row of rows) {
     const campaign = row.campaign;
     if (campaign == null) continue;
     withCampaign += 1;
@@ -244,7 +270,7 @@ async function collectFromBrandFeed(context: AdapterContext): Promise<AdapterRes
       categoryLabel:
         typeof campaign.category_id === 'number'
           ? (categories.get(campaign.category_id) ?? CATEGORY_FALLBACK[campaign.category_id] ?? '')
-          : '',
+          : shelfFrom(text(campaign.slug)),
       title: title === '' ? merchant : title,
       description,
       eligibilityText: 'bKash payment',
@@ -261,8 +287,72 @@ async function collectFromBrandFeed(context: AdapterContext): Promise<AdapterRes
     );
   }
 
-  context.log(`brand feed: ${String(offers.length)} merchants with live campaigns`);
-  return { offers, pagesFetched: 2, warnings };
+  if (withCampaign > MAX_BRANDS) {
+    warnings.push(`feed listed ${String(withCampaign)} merchants with campaigns; ingested the first ${String(MAX_BRANDS)}.`);
+  }
+  return { offers, warnings };
+}
+
+/**
+ * Every brand through the site's own search.
+ *
+ * Since late 2026 `/api/brands` answers only a search, twenty brands at a
+ * time, with no paging. So this asks for every letter and digit, and where a
+ * term fills all twenty slots, asks again one letter longer on either side
+ * ("a" → "ab", "ba" …) until every term comes back short of twenty — at that
+ * point every brand containing it has been seen. About eight hundred brands
+ * take a thousand-odd requests at the polite pace (30 minutes): fine for a
+ * daily job, and it stops early once new names stop turning up.
+ */
+const SEARCH_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789'.split('');
+const SEARCH_BUDGET = Number(process.env['OFFER_FINDER_SEARCH_BUDGET'] ?? 1_400);
+const SEARCH_PAGE = 20;
+
+async function collectFromSearch(context: AdapterContext): Promise<AdapterResult | null> {
+  const seen = new Map<string, BrandRow>();
+  const asked = new Set<string>();
+  const queue = [...SEARCH_ALPHABET];
+  let requests = 0;
+  let failures = 0;
+  let sinceNew = 0;
+  while (queue.length > 0 && requests < SEARCH_BUDGET) {
+    const term = queue.shift()!;
+    if (asked.has(term)) continue;
+    asked.add(term);
+    requests += 1;
+    const page = await context.fetchPage(`${BRANDS_ENDPOINT}?search=${encodeURIComponent(term)}`);
+    if (!page.ok || page.body === '') {
+      failures += 1;
+      if (failures >= 10 && seen.size === 0) break;
+      continue;
+    }
+    let rows: unknown;
+    try {
+      rows = JSON.parse(page.body);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(rows)) continue;
+    const before = seen.size;
+    for (const row of rows as BrandRow[]) {
+      const key = text(row.slug) || text(row.name);
+      if (key !== '' && !seen.has(key)) seen.set(key, row);
+    }
+    sinceNew = seen.size > before ? 0 : sinceNew + 1;
+    // Saturated: hundreds of searches in a row with nothing new.
+    if (sinceNew >= 400 && seen.size > 0) break;
+    if (rows.length >= SEARCH_PAGE && term.length < 4) {
+      for (const c of SEARCH_ALPHABET) {
+        queue.push(term + c);
+        queue.push(c + term);
+      }
+    }
+  }
+  context.log(`brand search: ${String(seen.size)} brands from ${String(requests)} searches`);
+  if (seen.size === 0) return null;
+  const categories = await categoryNames(context);
+  const { offers, warnings } = offersFromRows([...seen.values()], categories);
+  return { offers, pagesFetched: requests + 1, warnings };
 }
 
 export const bkashOfferFinderAdapter: OfferSourceAdapter = {
@@ -280,6 +370,9 @@ export const bkashOfferFinderAdapter: OfferSourceAdapter = {
     // the rendered pages.
     const fromFeed = await collectFromBrandFeed(context);
     if (fromFeed != null && fromFeed.offers.length > 0) return fromFeed;
+    // The feed now answers only searches: list every brand through them.
+    const fromSearch = await collectFromSearch(context);
+    if (fromSearch != null && fromSearch.offers.length > 0) return fromSearch;
     context.log('brand feed unavailable — falling back to the rendered pages');
 
     const offers: RawOffer[] = [];
